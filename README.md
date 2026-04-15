@@ -112,4 +112,4 @@ Key interactive commands: `addcomp`, `removecomp`, `fit`, `freeze`, `rebin`, `sa
 - **NICER-specific:** Event file paths assume `ni<obsid>_0mpu7_cl.evt`. Other instruments require changes to `build_evt_path()`.
 - **Interactive mode** requires a display (TkAgg backend). Headless use needs X-forwarding or VNC.
 - **`cont4` disabled by default.** Enable `FIT_CONT4_ENABLE = True` only for complex spectral states requiring a four-component continuum.
-- **No parameter uncertainties.** Lorentzian parameter errors are not yet computed; a Hessian-based patch is planned in upcoming versions.
+
