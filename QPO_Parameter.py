@@ -8,7 +8,21 @@ Edit the values in this file directly.  A validation pass runs automatically
 at import time; a clear error is raised if any value is out of range or has
 the wrong type, so problems are caught before the first observation is touched.
 
+Changes from v1
+----------------
+- Per-component continuum centroid limits (narrow / wide / free).
+- Multi-scale smoothing for candidate finding.
+- Higher amplitude and constant caps (guardrails catch pathological cases).
+- cont4 fallback stage for complex states.
+- Relaxed overshoot guardrail for log-rebinned data.
+- Cross-band fallback uses diagnostic peaks when all bands are bad.
 
+Changes from v2
+---------------
+- FIT_METHOD = "TripleA": custom Whittle-likelihood optimiser with
+  analytical gradient and true L-BFGS-B box constraints.
+  See QPO_TripleA.py for full documentation.
+- AAA_* parameter block for TripleA tuning.
 """
 
 from __future__ import annotations
@@ -17,16 +31,16 @@ import warnings
 # ==========================
 # INPUT DIRECTORY STRUCTURE
 # ==========================
-BASE_DIR   = "/data2/NICER_DATA/NICER/spectral_fitting_results/"
-SOURCE     = "GX339"
-OBSIDS_TXT = "GX339_obs_hs.txt"
+BASE_DIR   = "/data2/sena.ozgur/nicer/"
+SOURCE     = "maxij1820+70"
+OBSIDS_TXT = "MAXIJ1820_sample.txt"
 
 # ==========================
 # OUTPUT DIRECTORY STRUCTURE
 # ==========================
-OUTDIR_BASE    = "/data2/NICER_DATA/NICER/GX339_timing_res/"
+OUTDIR_BASE    = "/data2/NICER_DATA/NICER/MAXIJ1820_timing_res/"
 COMMON_DIRNAME = "commonfiles"
-OUT_CSV_NAME   = "gx339_qpo_summary.csv"
+OUT_CSV_NAME   = "MAXIJ1820_qpo_summary.csv"
 
 # ==========================
 # TIMING PARAMETERS
@@ -60,7 +74,7 @@ PEAK_MAX_CANDIDATES = 8
 
 # Candidate finder prominence threshold.
 # Now operates in z-score space (sigma units) instead of ratio space.
-PEAK_PROMINENCE = 0.6
+PEAK_PROMINENCE = 0.5
 
 # ==========================
 # RMS INTEGRATION
@@ -116,7 +130,15 @@ QPO_SORT_BY = "area"   # "area", "freq", or "q"
 # ==========================
 # OPTIMIZER + ACCEPTANCE
 # ==========================
-FIT_METHOD      = "Powell"
+# Supported values: "TripleA" | "Powell" | "Nelder-Mead"
+#
+# "TripleA" (default): custom L-BFGS-B optimiser with analytical Whittle
+#   gradient and true box constraints.  Faster convergence, more reliable
+#   on ridges, and no prior-cliff problems.  See QPO_TripleA.py.
+#
+# "Powell" / "Nelder-Mead": Stingray's gradient-free path (legacy).
+#   Use for comparison or if QPO_TripleA.py is not available.
+FIT_METHOD      = "TripleA"
 FIT_RCHI_MAX    = 1.5     # marks fit_ok=False in CSV if rchi2 > this
 FIT_RCHI_TARGET = 1.3     # retry ladder stops early once rchi2 <= this
 
@@ -132,6 +154,13 @@ FIT_CONST_CAP_FACTOR = 5.0
 # ==========================
 # FITTING: MULTI-START ROBUSTNESS
 # ==========================
+# Controls the outer _jittered_starts loop in _run_stage.
+# When FIT_METHOD = "TripleA", the total independent starts per stage call
+# is FIT_N_STARTS × AAA_N_STARTS (outer × inner).  The outer loop provides
+# diversity across continuum + QPO joint configurations; the inner loop
+# polishes each configuration with L-BFGS-B.
+# In the interactive fitter the outer loop is bypassed, so only AAA_N_STARTS
+# starts run.
 FIT_MULTI_START = True
 FIT_N_STARTS    = 3
 FIT_JITTER_FRAC = 0.12
@@ -187,14 +216,57 @@ FIT_GUARD_COMP_LOCAL_AMP_FACTOR  = 6.0
 FIT_MAX_RETRIES = 3
 
 # ==========================
+# OPTIMIZER: TRIPLEA (AAA)
+# ==========================
+# These knobs are read by QPO_TripleA.tripleA_fit_once at call time.
+# Changes take effect immediately without restarting the pipeline.
+#
+# AAA_N_STARTS
+#   Independent L-BFGS-B starts per tripleA_fit_once call.
+#   Each start costs ~50-200 gradient evaluations, compared to
+#   ~1000-5000 function evaluations for a Powell attempt — so 5
+#   TripleA starts cost less wall time than 1 Powell attempt.
+#
+# AAA_JITTER_STD_LOG
+#   Standard deviation of the log-space perturbation applied to
+#   amplitude and FWHM between starts.
+#   0.30 → typical multiplier exp(±0.30) ≈ 0.74–1.35.
+#   Increase for badly-conditioned fits; decrease for highly precise seeds
+#   (e.g. loaded from a struct).
+#
+# AAA_JITTER_STD_NU0
+#   Std of the ν₀ perturbation as a fraction of the x0 range.
+#   0.10 → ±10 % of the allowed centroid window.
+#
+# AAA_FTOL
+#   L-BFGS-B function-value convergence tolerance.
+#   1e-11 is tighter than the scipy default (2.22e-9) and appropriate
+#   given the analytical gradient.
+#
+# AAA_GTOL
+#   Gradient-norm convergence tolerance.
+#   The optimiser declares convergence when max|∇L| < AAA_GTOL.
+#
+# AAA_MAXITER
+#   Maximum L-BFGS-B iterations per start.
+#   1000 is generous; well-conditioned fits converge in 20-100 iterations.
+
+AAA_N_STARTS       = 5
+AAA_JITTER_STD_LOG = 0.30
+AAA_JITTER_STD_NU0 = 0.10
+AAA_FTOL           = 1e-11
+AAA_GTOL           = 1e-7
+AAA_MAXITER        = 1000
+
+# ==========================
 # MODEL ORDER SELECTION (IC)
 # ==========================
-CONT_IC_CRITERION = "bic"
+CONT_IC_CRITERION = "aic"
 CONT_IC_DELTA_MIN = 15.0
 
 QPO_IC_CRITERION = "aic"
 #If Qpos weak (as in the case of GX339-4) keep low (even 0). If qpos strong, can increase. 
-QPO_IC_DELTA_MIN = 10
+QPO_IC_DELTA_MIN = 0
 
 # ==========================
 # FITTING: FORCED THIRD CONTINUUM
@@ -280,7 +352,7 @@ CAND_REBIN_FACTOR = 2.0
 # ==========================
 # PARALLEL EXECUTION
 # ==========================
-PARALLEL_ENABLE       = True
+PARALLEL_ENABLE       = False
 N_WORKERS             = 32
 PARALLEL_START_METHOD = "spawn"
 
@@ -408,6 +480,14 @@ def _validate_config() -> None:
         errors.append(f"N_WORKERS must be >= 1, got {N_WORKERS}")
     if str(PARALLEL_START_METHOD).lower() not in ("spawn", "fork", "forkserver"):
         errors.append(f"PARALLEL_START_METHOD must be 'spawn', 'fork', or 'forkserver'")
+
+    # TripleA knobs
+    _chk_pos("AAA_N_STARTS",       AAA_N_STARTS)
+    _chk_pos("AAA_JITTER_STD_LOG", AAA_JITTER_STD_LOG, allow_zero=True)
+    _chk_pos("AAA_JITTER_STD_NU0", AAA_JITTER_STD_NU0, allow_zero=True)
+    _chk_pos("AAA_FTOL",           AAA_FTOL)
+    _chk_pos("AAA_GTOL",           AAA_GTOL)
+    _chk_pos("AAA_MAXITER",        AAA_MAXITER)
 
     if errors:
         msg = "QPO_Parameter.py — validation errors:\n" + "\n".join(f"  • {e}" for e in errors)

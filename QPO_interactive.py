@@ -7,7 +7,29 @@ Terminal-driven interactive Lorentzian fitter with a live matplotlib window.
 The plot window shows the PDS, model overlay, individual components, and
 residuals.  All interaction is typed in the terminal.
 
+PATCH NOTES (vs. original)
+--------------------------
+* The interactive fitter now propagates the *true* effective number of
+  averaged powers per bin (`m_eff`) from the rebinned Stingray PDS into
+  the Powerspectrum object used by `fit_lorentzians`.  Hardcoding `ps.m=1`
+  on a log-rebinned PDS made the Whittle likelihood ~m× too shallow,
+  letting the priors drag known-good parameters off into the bounds.
+* `_compute_rchi2` and `_sigma` now use the same `m_eff`.
+* Continuum x0 bound tightened to FIT_CONT_X0_MAX_HZ (matches batch fitter).
+* Amplitude cap is now `max(5*c['amp'], 5*low-f level)` instead of 50× current.
+* `_load_pds`, `_rebuild_pds`, and `_apply_rebin` all recompute `m_eff`
+  from the rebinned `pds.m` array.
 
+TripleA integration (vs. previous patch)
+-----------------------------------------
+* When FIT_METHOD = "TripleA" (or fit_method is set to "TripleA" via
+  setparam), _run_direct_fit bypasses the Stingray fit_lorentzians loop
+  entirely and calls QPO_TripleA.tripleA_fit_once instead.
+* Frozen parameters are implemented as tight L-BFGS-B box bounds rather
+  than prior penalty windows — the semantics are identical but the
+  optimiser respects them as hard constraints.
+* The Stingray loop remains unchanged and is still used for any other
+  fitmethod value (Powell, Nelder-Mead).
 
 Commands
 --------
@@ -20,7 +42,7 @@ Commands
   list                     Print the component table with frozen status
   params                   Show all tunable parameters
   setparam   <n> <val>     Set a parameter (e.g. setparam dt 0.005)
-  fit                      Run the Stingray optimiser on the current components
+  fit                      Run the optimiser on the current components
   status                   Print fit statistics
   saveresult [path.json]   Save fit result struct  (default: update the loaded struct)
   load <obsid> [band]      Load a saved fit struct as initial components
@@ -87,6 +109,7 @@ from QPO_utils import (
     load_pds_for_band,
 )
 from QPO_plot import save_band_plot, save_threeband_plot, fitresult_to_band_block
+from QPO_TripleA import tripleA_fit_once as _tripleA_fit_once
 
 # ---------------------------------------------------------------------------
 # ANSI colours
@@ -128,7 +151,7 @@ class TerminalFitter:
   list                     Print the component table with frozen status
   params                   Show all tunable parameters
   setparam  <n> <val>      Change a parameter (e.g. setparam dt 0.005)
-  fit                      Run the Stingray optimiser on the current components
+  fit                      Run the optimiser on the current components
   status                   Print fit statistics
   saveresult [path.json]   Save fit result (default: update the loaded struct)
   load <obsid> [band]      Load a saved struct as initial components
@@ -208,7 +231,7 @@ class TerminalFitter:
             "qpo_fmax":        float(getattr(P, "QPO_FMAX",         10.0)),
             "qpo_min_q":       float(getattr(P, "QPO_MIN_Q",        3.0)),
             "fit_rchi_max":    float(getattr(P, "FIT_RCHI_MAX",     1.5)),
-            "fit_method":      str(getattr(P,   "FIT_METHOD",       "Powell")),
+            "fit_method":      str(getattr(P,   "FIT_METHOD",       "TripleA")),
             "fit_n_starts":    int(getattr(P,   "FIT_N_STARTS",     6)),
             "fit_jitter_frac": float(getattr(P, "FIT_JITTER_FRAC",  0.18)),
             "fit_random_seed": int(getattr(P,   "FIT_RANDOM_SEED",  42)),
@@ -233,8 +256,8 @@ class TerminalFitter:
             "qpo_fmax":        (float, "QPO detect upper limit (Hz)",      False, False),
             "qpo_min_q":       (float, "Min Q for QPO detection",          False, False),
             "fit_rchi_max":    (float, "rchi2 threshold for plot colouring",False,False),
-            "fit_method":      (str,   "Optimizer (Powell / Nelder-Mead)", False, False),
-            "fit_n_starts":    (int,   "Number of multi-starts",           False, False),
+            "fit_method":      (str,   "Optimizer (TripleA / Powell / Nelder-Mead)", False, False),
+            "fit_n_starts":    (int,   "Number of multi-starts (Stingray path only)", False, False),
             "fit_jitter_frac": (float, "Multi-start jitter fraction",      False, False),
             "fit_random_seed": (int,   "RNG seed",                         False, False),
             "cont_fwhm_min":   (float, "Continuum FWHM lower bound (Hz)",  False, False),
@@ -697,7 +720,9 @@ class TerminalFitter:
             if frz: frz_summary.append(f"[{i}]:{','.join(sorted(frz))}")
         if frz_summary:
             print(f"  {_D}Frozen: {' '.join(frz_summary)}{_R}")
-        print(f"  {_BL}Running Stingray optimiser…  "
+
+        fmethod = str(self._params["fit_method"])
+        print(f"  {_BL}Running optimiser ({fmethod})…  "
               f"(const={self.const:.4g} fixed, m_eff={self._m_eff}){_R}", flush=True)
 
         fitres = self._run_direct_fit()
@@ -724,34 +749,43 @@ class TerminalFitter:
 
     def _run_direct_fit(self) -> Optional[FitResult]:
             """
-            Optimise directly via Stingray with no IC, no guardrails.
-    
-            Design notes
-            ------------
+            Optimise directly with no IC, no guardrails.
+
+            Supports two optimiser paths controlled by self._params["fit_method"]:
+
+            TripleA path (default)
+            ----------------------
+            Calls QPO_TripleA.tripleA_fit_once once with the current component
+            seed.  TripleA manages its own multi-start loop (AAA_N_STARTS restarts)
+            internally — the outer Stingray loop is bypassed entirely.
+            Frozen parameters are implemented as tight L-BFGS-B box bounds rather
+            than prior penalty windows.
+
+            Stingray path (Powell / Nelder-Mead / other)
+            ---------------------------------------------
+            Unchanged from the previous version: builds priors as half-uniform /
+            hard-truncated-uniform penalty functions and calls fit_lorentzians in
+            a jittered multi-start loop.
+
+            Design notes (shared)
+            ---------------------
             * ps.m is set to self._m_eff (the true number of averaged powers per
               rebinned bin), so the Whittle likelihood weight matches the batch
               fitter.
-    
             * The white-noise const is NOT pinned.  It is given a half-uniform
               prior over [0, 2 × const_seed], identical to the batch fitter.
-              (An earlier version pinned it to ±1 %, which interacts catastrophically
-              with the now-correct m_eff: the likelihood is so sharp that any small
-              mismatch between the loaded const and the data's actual white floor
-              drives the posterior to -inf, and Powell returns a 1e16 sentinel.)
-    
             * Per-component bounds are derived from the CURRENT value of each
               loaded/edited component, not from global limits.  This guarantees
               warm-start parameters are strictly interior to their priors, so
-              Powell's first probe step never lands on a hard-truncation boundary
-              (where prior = 0 → log-posterior = -inf → sentinel).
-    
-            * Frozen fields still get a ±0.1 % pin window, narrow enough to be
-              effectively fixed but with non-zero prior density.
+              the optimiser's first probe step never lands on a hard-truncation
+              boundary (where prior = 0 → log-posterior = -inf → sentinel).
+            * Frozen fields get a ±0.1 % pin window for the Stingray path and a
+              tight box bound for the TripleA path — semantics are identical.
             """
             nlor = len(self.components)
             if nlor == 0:
                 return None
-    
+
             fmethod  = str(self._params["fit_method"])
             n_starts = int(self._params["fit_n_starts"])
             jitter   = float(self._params["fit_jitter_frac"])
@@ -765,8 +799,8 @@ class TerminalFitter:
             qfwhm_lo = float(self._params["qpo_fwhm_min"])
             qfwhm_hi = float(self._params["qpo_fwhm_max"])
             eps      = 1e-30
-    
-            # Build the Powerspectrum object Stingray will fit against.
+
+            # Build the Powerspectrum object.
             ps           = Powerspectrum()
             ps.freq      = self._f.copy()
             ps.power     = self._p.copy()
@@ -774,10 +808,8 @@ class TerminalFitter:
             ps.df        = float(np.median(np.diff(self._f))) if self._f.size > 1 else 1.0
             ps.m         = int(self._m_eff)
             ps.norm      = "frac"
-    
-            # Re-derive const seed from the data's high-frequency median, NOT from
-            # whatever was loaded in self.const.  The loaded const may be from a
-            # different binning or slightly stale.
+
+            # Re-derive const seed from the data's high-frequency median.
             hf_mask = (self._f >= 30.0) & np.isfinite(self._p) & (self._p > 0)
             if np.any(hf_mask):
                 const_seed = float(np.nanmedian(self._p[hf_mask]))
@@ -785,95 +817,58 @@ class TerminalFitter:
                 const_seed = float(self.const)
             const_seed = max(const_seed, 1e-30)
             const_cap  = max(2.0 * const_seed, 1e-29)
-    
-            # Global amp caps from the low-frequency PDS level (matches batch fitter)
+
+            # Global amp caps from the low-frequency PDS level.
             cont_amp_cap_g = max(cont_af * self._lowf, 1e-10)
             qpo_amp_cap_g  = max(qpo_af  * self._lowf, 1e-10)
-    
-            # Per-component bounds: always wide enough that the CURRENT value is
-            # strictly interior, so Powell never starts on a prior boundary.
+
+            # Per-component bounds.
             comp_types: List[str] = []
             x0_lims:    List[Tuple[float, float]] = []
             fwhm_lims:  List[Tuple[float, float]] = []
             amp_caps:   List[float] = []
-    
+
             for c in self.components:
                 ctype = str(c["type"])
                 comp_types.append(ctype)
-    
+
                 cur_nu0  = float(c["nu0"])
                 cur_fwhm = float(c["fwhm"])
                 cur_amp  = float(c["amp"])
-    
+
                 if ctype == "qpo":
-                    # nu0: ±1 Hz around current, clipped to candidate band
                     lo = max(cfmin, cur_nu0 - 1.0)
                     hi = min(cfmax, cur_nu0 + 1.0)
-                    # ensure current value is strictly interior
                     if cur_nu0 - lo < 1e-6: lo = max(cfmin, cur_nu0 - max(0.05, 0.05 * cur_nu0))
                     if hi - cur_nu0 < 1e-6: hi = min(cfmax, cur_nu0 + max(0.05, 0.05 * cur_nu0))
                     x0_lims.append((lo, hi))
-    
-                    # fwhm: factor of 5 around current, clipped to global qpo range
+
                     f_lo = max(qfwhm_lo, cur_fwhm / 5.0)
                     f_hi = min(qfwhm_hi, cur_fwhm * 5.0)
                     if f_hi <= f_lo: f_lo, f_hi = qfwhm_lo, qfwhm_hi
                     fwhm_lims.append((f_lo, f_hi))
-    
+
                     amp_caps.append(max(qpo_amp_cap_g, 20.0 * cur_amp, 1e-10))
-    
+
                 else:  # continuum
-                    # nu0: at least ±0.5 Hz around current, but no narrower than
-                    # the global ±x0_max bound.  This handles loaded continuum
-                    # centroids that sit outside the user's nominal x0_max.
                     half = max(x0_max, abs(cur_nu0) + 0.5, 0.5)
                     x0_lims.append((-half, +half))
-    
-                    # fwhm: factor of 5 around current
+
                     f_lo = max(cfwhm_lo, cur_fwhm / 5.0)
                     f_hi = min(cfwhm_hi, cur_fwhm * 5.0)
                     if f_hi <= f_lo: f_lo, f_hi = cfwhm_lo, cfwhm_hi
                     fwhm_lims.append((f_lo, f_hi))
-    
+
                     amp_caps.append(max(cont_amp_cap_g, 20.0 * cur_amp, 1e-10))
-    
-            # Build priors.  const is FREE (half-uniform), not pinned.
-            priors: Dict[str, Any] = {}
-            for i, c in enumerate(self.components):
-                frz = c.get("frozen", set())
-    
-                if "amp" in frz:
-                    v = max(float(c["amp"]), eps)
-                    w = max(v * 1e-3, 1e-12)
-                    priors[f"amplitude_{i}"] = _hard_trunc_uniform(v - w, v + w)
-                else:
-                    priors[f"amplitude_{i}"] = _half_uniform(amp_caps[i])
-    
-                if "nu0" in frz:
-                    v = float(c["nu0"])
-                    w = max(abs(v) * 1e-3, 1e-6)
-                    priors[f"x_0_{i}"] = _hard_trunc_uniform(v - w, v + w)
-                else:
-                    priors[f"x_0_{i}"] = _hard_trunc_uniform(*x0_lims[i])
-    
-                if "fwhm" in frz:
-                    v = max(float(c["fwhm"]), eps)
-                    w = max(v * 1e-3, 1e-6)
-                    priors[f"fwhm_{i}"] = _hard_trunc_uniform(v - w, v + w)
-                else:
-                    priors[f"fwhm_{i}"] = _hard_trunc_uniform(*fwhm_lims[i])
-    
-            # const: free half-uniform prior, like the batch fitter
-            priors[f"amplitude_{nlor}"] = _half_uniform(const_cap)
-    
-            # t0: component params + const seed
+
+            # Build t0 from current component values.
             base_t0 = np.array([
                 val
                 for c in self.components
                 for val in (float(c["amp"]), float(c["nu0"]), float(c["fwhm"]))
             ] + [const_seed], dtype=float)
-    
-            # Sanity check: ensure every t0 component is strictly interior to its prior
+
+            # Sanity check: ensure every t0 component is strictly interior to its bounds.
             for i in range(nlor):
                 a  = base_t0[3*i]
                 x  = base_t0[3*i+1]
@@ -889,82 +884,166 @@ class TerminalFitter:
                 if a >= amp_caps[i]:
                     print(f"  {_YL}[warn] comp [{i}] amp={a:.4g} ≥ cap={amp_caps[i]:.4g} "
                           f"— widening{_R}")
-    
+
             rng      = np.random.default_rng(int(self._params.get("fit_random_seed", 42)))
             best_res = None
             best_aic = np.inf
             n_failed = 0
-    
-            for start_idx in range(max(1, n_starts)):
-                t0 = base_t0.copy()
-    
-                if start_idx > 0 and jitter > 0:
-                    for i, c in enumerate(self.components):
-                        frz   = c.get("frozen", set())
-                        lo_x, hi_x = x0_lims[i]
-                        flo, fhi   = fwhm_lims[i]
-    
-                        if "amp" not in frz:
-                            t0[3*i]   = max(eps, t0[3*i] * (1.0 + jitter * rng.standard_normal()))
-                        if "nu0" not in frz:
-                            t0[3*i+1] = float(np.clip(
-                                t0[3*i+1] + jitter * (hi_x - lo_x) * 0.5 * rng.standard_normal(),
-                                lo_x + 1e-9 * (hi_x - lo_x),
-                                hi_x - 1e-9 * (hi_x - lo_x),
-                            ))
-                        if "fwhm" not in frz:
-                            t0[3*i+2] = float(np.clip(
-                                t0[3*i+2] * max(0.5, 1.0 + jitter * rng.standard_normal()),
-                                flo + 1e-9 * (fhi - flo),
-                                fhi - 1e-9 * (fhi - flo),
-                            ))
-                    # const: small jitter, but stay interior
-                    t0[-1] = float(np.clip(
-                        const_seed * (1.0 + 0.05 * rng.standard_normal()),
-                        1e-30, const_cap * 0.999,
-                    ))
-    
-                t0 = _repair_params(
-                    t0, nlor=nlor, include_const=True,
-                    x0_lims=x0_lims, fwhm_lims=fwhm_lims,
-                    const_max=const_cap, eps_amp=eps,
+
+            # ---- TripleA short-circuit ------------------------------------
+            # TripleA handles its own multi-start loop internally.
+            # Frozen fields become tight box bounds; the Stingray prior-penalty
+            # approach is not used.
+            if fmethod.lower() == "triplea":
+                # Build per-component amplitude lower bounds and tighten bounds
+                # for any frozen fields.
+                aaa_amp_lo = []
+                aaa_x0     = list(x0_lims)
+                aaa_fwhm   = list(fwhm_lims)
+                aaa_acaps  = list(amp_caps)
+
+                for i, c in enumerate(self.components):
+                    frz = c.get("frozen", set())
+                    v_a = max(float(c["amp"]),  eps)
+                    v_x = float(c["nu0"])
+                    v_f = max(float(c["fwhm"]), eps)
+
+                    # Amplitude lower bound (always eps unless frozen)
+                    if "amp" in frz:
+                        w = max(v_a * 1e-3, 1e-12)
+                        aaa_amp_lo.append(max(v_a - w, eps))
+                        aaa_acaps[i] = v_a + w
+                    else:
+                        aaa_amp_lo.append(eps)
+
+                    # ν₀ bounds (tight window if frozen)
+                    if "nu0" in frz:
+                        w = max(abs(v_x) * 1e-3, 1e-6)
+                        aaa_x0[i] = (v_x - w, v_x + w)
+
+                    # FWHM bounds (tight window if frozen)
+                    if "fwhm" in frz:
+                        w = max(v_f * 1e-3, 1e-6)
+                        aaa_fwhm[i] = (v_f - w, v_f + w)
+
+                best_res, _exc = _tripleA_fit_once(
+                    ps,
+                    nlor          = nlor,
+                    t0            = base_t0.tolist(),
+                    include_const = True,
+                    x0_lims       = aaa_x0,
+                    fwhm_lims     = aaa_fwhm,
+                    amp_caps      = aaa_acaps,
+                    amp_lo_list   = aaa_amp_lo,
+                    const_max     = const_cap,
                 )
-    
-                try:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        _par, res = fit_lorentzians(
-                            ps, nlor, t0.tolist(),
-                            fit_whitenoise=True,
-                            max_post=True,
-                            priors=priors,
-                            fitmethod=fmethod,
-                        )
-                except Exception as exc:
-                    n_failed += 1
-                    continue
-    
-                if res is None:
-                    n_failed += 1
-                    continue
-    
-                aic = float(getattr(res, "aic", np.inf))
-                # Reject Stingray's sentinel value (1e16 means optimizer never converged)
-                if aic >= 1e15:
-                    n_failed += 1
-                    continue
-    
-                if aic < best_aic:
-                    best_aic = aic
-                    best_res = res
-    
-            if best_res is None:
-                print(f"  {_RD}All {n_starts} optimizer starts failed "
-                      f"({n_failed} returned sentinel/exception).{_R}")
-                print(f"  {_D}Try: setparam fit_method Nelder-Mead{_R}")
-                print(f"  {_D}Or:  edit a component slightly to nudge the start point{_R}")
-                return None
-    
+                if best_res is None:
+                    print(f"  {_RD}TripleA failed: {_exc}{_R}")
+                    print(f"  {_D}Try: setparam fit_method Powell{_R}")
+                    return None
+                best_aic = float(best_res.aic)
+                # n_failed stays 0 — TripleA handles retries internally.
+
+            else:
+                # ---- Stingray / Powell / Nelder-Mead loop (unchanged) ----
+
+                # Build priors.  const is FREE (half-uniform), not pinned.
+                priors: Dict[str, Any] = {}
+                for i, c in enumerate(self.components):
+                    frz = c.get("frozen", set())
+
+                    if "amp" in frz:
+                        v = max(float(c["amp"]), eps)
+                        w = max(v * 1e-3, 1e-12)
+                        priors[f"amplitude_{i}"] = _hard_trunc_uniform(v - w, v + w)
+                    else:
+                        priors[f"amplitude_{i}"] = _half_uniform(amp_caps[i])
+
+                    if "nu0" in frz:
+                        v = float(c["nu0"])
+                        w = max(abs(v) * 1e-3, 1e-6)
+                        priors[f"x_0_{i}"] = _hard_trunc_uniform(v - w, v + w)
+                    else:
+                        priors[f"x_0_{i}"] = _hard_trunc_uniform(*x0_lims[i])
+
+                    if "fwhm" in frz:
+                        v = max(float(c["fwhm"]), eps)
+                        w = max(v * 1e-3, 1e-6)
+                        priors[f"fwhm_{i}"] = _hard_trunc_uniform(v - w, v + w)
+                    else:
+                        priors[f"fwhm_{i}"] = _hard_trunc_uniform(*fwhm_lims[i])
+
+                priors[f"amplitude_{nlor}"] = _half_uniform(const_cap)
+
+                for start_idx in range(max(1, n_starts)):
+                    t0 = base_t0.copy()
+
+                    if start_idx > 0 and jitter > 0:
+                        for i, c in enumerate(self.components):
+                            frz   = c.get("frozen", set())
+                            lo_x, hi_x = x0_lims[i]
+                            flo, fhi   = fwhm_lims[i]
+
+                            if "amp" not in frz:
+                                t0[3*i]   = max(eps, t0[3*i] * (1.0 + jitter * rng.standard_normal()))
+                            if "nu0" not in frz:
+                                t0[3*i+1] = float(np.clip(
+                                    t0[3*i+1] + jitter * (hi_x - lo_x) * 0.5 * rng.standard_normal(),
+                                    lo_x + 1e-9 * (hi_x - lo_x),
+                                    hi_x - 1e-9 * (hi_x - lo_x),
+                                ))
+                            if "fwhm" not in frz:
+                                t0[3*i+2] = float(np.clip(
+                                    t0[3*i+2] * max(0.5, 1.0 + jitter * rng.standard_normal()),
+                                    flo + 1e-9 * (fhi - flo),
+                                    fhi - 1e-9 * (fhi - flo),
+                                ))
+                        t0[-1] = float(np.clip(
+                            const_seed * (1.0 + 0.05 * rng.standard_normal()),
+                            1e-30, const_cap * 0.999,
+                        ))
+
+                    t0 = _repair_params(
+                        t0, nlor=nlor, include_const=True,
+                        x0_lims=x0_lims, fwhm_lims=fwhm_lims,
+                        const_max=const_cap, eps_amp=eps,
+                    )
+
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            _par, res = fit_lorentzians(
+                                ps, nlor, t0.tolist(),
+                                fit_whitenoise=True,
+                                max_post=True,
+                                priors=priors,
+                                fitmethod=fmethod,
+                            )
+                    except Exception:
+                        n_failed += 1
+                        continue
+
+                    if res is None:
+                        n_failed += 1
+                        continue
+
+                    aic = float(getattr(res, "aic", np.inf))
+                    if aic >= 1e15:
+                        n_failed += 1
+                        continue
+
+                    if aic < best_aic:
+                        best_aic = aic
+                        best_res = res
+
+                if best_res is None:
+                    print(f"  {_RD}All {n_starts} optimizer starts failed "
+                          f"({n_failed} returned sentinel/exception).{_R}")
+                    print(f"  {_D}Try: setparam fit_method TripleA{_R}")
+                    print(f"  {_D}Or:  edit a component slightly to nudge the start point{_R}")
+                    return None
+
+            # ---- Extract result (common to both paths) --------------------
             p_opt    = np.asarray(best_res.p_opt, float)
             pars_out = np.array(
                 [(p_opt[3*i+1], p_opt[3*i+2], p_opt[3*i]) for i in range(nlor)], float
@@ -973,10 +1052,11 @@ class TerminalFitter:
             model     = np.asarray(best_res.mfit, float)
             rchi2     = _compute_rchi2(self._p, model, self._e,
                                         m_avg=int(self._m_eff), npar=p_opt.size)
-    
+
             # ---- DEBUG ----
             print(f"  [DEBUG] best_aic={best_aic:.3f}  rchi2={rchi2:.3f}  "
-                  f"failed_starts={n_failed}/{n_starts}")
+                  f"failed_starts={n_failed}"
+                  + (f"/{n_starts}" if fmethod.lower() != "triplea" else " (TripleA)"))
             print(f"  [DEBUG] p_opt:")
             for i in range(nlor):
                 a, x, w = float(p_opt[3*i]), float(p_opt[3*i+1]), float(p_opt[3*i+2])
@@ -986,13 +1066,14 @@ class TerminalFitter:
             print(f"  [DEBUG] model min/max = {mn:+.4e} / {mx:+.4e}  "
                   f"negative_bins={int(np.sum(model < 0))}")
             # ---- END DEBUG ----
-    
-            # Update self.const with the fitted value (no longer pinned)
+
+            # Update self.const with the fitted value.
             self.const = const_val
-    
+
             return FitResult(
                 ok=True,
-                message=f"OK (direct  nlor={nlor}  m={self._m_eff}  const={const_val:.3g})",
+                message=(f"OK (direct  nlor={nlor}  m={self._m_eff}  "
+                          f"const={const_val:.3g}  method={fmethod})"),
                 nlor=nlor,
                 pars=pars_out,
                 comp_types=comp_types,
@@ -1336,7 +1417,8 @@ class TerminalFitter:
                 need = self._param_meta[k][2]
                 tag  = f"  {_D}[rebuild]{_R}" if need else ""
                 print(f"    {k:<18}  {str(val):<14}  {_D}{desc}{_R}{tag}")
-        print(f"\n  {_D}[rebuild] = reloads event file.  Use setparam <n> <value> to change.{_R}\n")
+        print(f"\n  {_D}[rebuild] = reloads event file.  Use setparam <n> <value> to change.{_R}")
+        print(f"  {_D}TripleA knobs (AAA_*) are set in QPO_Parameter.py only.{_R}\n")
 
     def _cmd_setparam(self, args: List[str]) -> None:
         if len(args) < 2:
@@ -1356,7 +1438,7 @@ class TerminalFitter:
         except (ValueError, TypeError):
             print(f"  {_RD}{name} expects {type_fn.__name__}, got {raw!r}{_R}"); return
 
-        if name == "fit_method" and val not in ("Powell", "Nelder-Mead", "L-BFGS-B"):
+        if name == "fit_method" and val not in ("TripleA", "Powell", "Nelder-Mead", "L-BFGS-B"):
             print(f"  {_YL}Unusual optimizer {val!r} — proceeding.{_R}")
         if name == "fit_n_starts" and val < 1:
             print(f"  {_RD}Must be >= 1.{_R}"); return
@@ -1374,7 +1456,7 @@ class TerminalFitter:
 
     def _cmd_plotresult(self, args: List[str]) -> None:
         """
-        
+        Save a publication-quality 2-panel PNG for the current band.
 
         Uses the current PDS arrays (self.freq / power / power_err) together
         with whichever of the following is available (in priority order):
@@ -1385,15 +1467,13 @@ class TerminalFitter:
         Default output path:
             <OUTDIR_BASE>/<obsid>/<obsid>_fit_<band_label>.png
         """
-        # --- Build band_block ---
         if self.fit_result is not None:
             band_block = fitresult_to_band_block(self.fit_result)
         elif self.components:
-            # No fit yet — overlay the current component set on the PDS
             band_block = {
                 "ok":         True,
                 "nlor":       len(self.components),
-                "rchi2":      float("nan"),   # no fit has been run
+                "rchi2":      float("nan"),
                 "const":      self.const,
                 "comp_types": [c["type"] for c in self.components],
                 "pars":       [[c["nu0"], c["fwhm"], c["amp"]]
@@ -1402,7 +1482,6 @@ class TerminalFitter:
         else:
             band_block = {"ok": False}
 
-        # --- Resolve output path ---
         if args:
             outpath = args[0]
         elif self.obsid:
@@ -1425,7 +1504,7 @@ class TerminalFitter:
 
     def _cmd_plotall(self, args: List[str]) -> None:
         """
-        Generate a 3-band  PNG using the saved struct.
+        Generate a 3-band publication-quality PNG using the saved struct.
 
         Workflow
         --------
@@ -1453,7 +1532,6 @@ class TerminalFitter:
                   f"({self._evt_path or 'path unknown'}).{_R}")
             return
 
-        # Band configurations: key → (band_kev | None, display label)
         BAND_CFG = {
             "full": (None,
                      "Full"),
@@ -1463,7 +1541,6 @@ class TerminalFitter:
                      "Hard 2-10 keV"),
         }
 
-        # Load the event file once — all bands share the same file
         print(f"  {_BL}Loading event file for all bands…{_R}", flush=True)
         ev_full = EventList.read(self._evt_path)
 
@@ -1477,7 +1554,6 @@ class TerminalFitter:
             bd = s.get(band_key, {})
 
             if not bd.get("ok", False):
-                # Panel will be rendered as "no data / no fit"
                 band_items.append({
                     "label": label,
                     "freq": None, "power": None, "power_err": None,
@@ -1497,7 +1573,7 @@ class TerminalFitter:
                     "power":      np.asarray(pds.power, float),
                     "power_err":  (None if pds.power_err is None
                                    else np.asarray(pds.power_err, float)),
-                    "band_block": dict(bd),   # the struct dict is already the right format
+                    "band_block": dict(bd),
                 })
                 print(f"    {_GR}{band_key}{_R}: {len(pds.freq)} bins")
 
@@ -1509,7 +1585,6 @@ class TerminalFitter:
                     "band_block": {"ok": False},
                 })
 
-        # --- Resolve output path ---
         if args:
             outpath = args[0]
         else:
@@ -1521,7 +1596,7 @@ class TerminalFitter:
         try:
             saved = save_threeband_plot(
                 self.obsid, band_items, outpath,
-                clobber=True,   # always overwrite on explicit user request
+                clobber=True,
             )
             print(f"  {_GR}Saved: {saved}{_R}")
         except Exception as exc:

@@ -4,7 +4,13 @@ QPO_struct.py  (v1.1)
 ======================
 Per-obsid fit result structs.
 
-
+Changes from v1.0
+-----------------
+- struct_summary now applies QPO_MIN_Q filter when listing QPO frequencies,
+  so the summary is consistent with the CSV writer and plot annotations.
+  Previously a low-Q spurious component (comp_type="qpo", Q<3) would appear
+  as a QPO frequency in the human-readable summary even though it was excluded
+  from all other outputs.
 
 One JSON file per obsid holds the results for all three energy bands.
 Only fit quality metrics and Lorentzian parameters are stored — no
@@ -32,8 +38,11 @@ File layout
         "deviance":    450.2,
         "red_deviance": 1.12,
         "const":       0.00142,
+        "peak_hz":     1.84,
         "comp_types":  ["cont", "cont", "qpo"],
-        "pars":        [[nu0, fwhm, amp], ...]
+        "pars":        [[nu0, fwhm, amp], ...],
+        "par_errors":  [[nu0_err, fwhm_err, amp_err], ...],  // null where unavailable
+        "const_err":   0.000012   // null if unavailable
       },
 
       "soft": { ... },   // absent if band was not fitted
@@ -73,7 +82,7 @@ import numpy as np
 
 import QPO_Parameter as P
 
-_STRUCT_VERSION = "1.0"
+_STRUCT_VERSION = "1.1"
 _BANDS = ("full", "soft", "hard")
 
 
@@ -95,11 +104,12 @@ def struct_path(obsid: str, outdir: Optional[str] = None) -> str:
 
 def save_fit_struct(
     fitres,
-    obsid:  str,
-    band:   str,
+    obsid:   str,
+    band:    str,
     *,
-    mjd:    Optional[float] = None,
-    outdir: Optional[str]   = None,
+    mjd:     Optional[float] = None,
+    peak_hz: Optional[float] = None,
+    outdir:  Optional[str]   = None,
 ) -> str:
     """
     Write one band's fit result into the obsid struct file.
@@ -136,7 +146,7 @@ def save_fit_struct(
             struct[b] = existing[b]
 
     # Build the band block
-    struct[str(band)] = _make_band_block(fitres)
+    struct[str(band)] = _make_band_block(fitres, peak_hz=peak_hz)
 
     # Atomic write
     tmp = path + ".tmp"
@@ -146,27 +156,123 @@ def save_fit_struct(
     return path
 
 
-def _make_band_block(fitres) -> Dict[str, Any]:
-    """Serialize one FitResult into the band sub-dict."""
+def _nu_max_list(
+    pars: list,
+    par_errors: list,
+) -> list:
+    """
+    Compute characteristic frequencies for all components.
+
+    Returns a list of dicts: [{"nu_max": float, "nu_max_err": float|None}, ...]
+    nu_max = sqrt(nu0² + (fwhm/2)²)  (Belloni convention)
+    nu_max_err via delta method from par_errors when available.
+    """
+    out = []
+    for i, p in enumerate(pars):
+        try:
+            nu0, fwhm = float(p[0]), float(p[1])
+            g      = 0.5 * fwhm
+            nmax   = float(np.sqrt(nu0 ** 2 + g ** 2))
+            # Error
+            errs   = par_errors[i] if (i < len(par_errors) and par_errors[i] is not None) else None
+            if errs is not None:
+                try:
+                    nu0_err, fwhm_err = float(errs[0]), float(errs[1])
+                    if nmax > 0:
+                        var = (nu0 / nmax) ** 2 * nu0_err ** 2 + (fwhm / (4 * nmax)) ** 2 * fwhm_err ** 2
+                        nmax_err = float(np.sqrt(max(var, 0.0)))
+                    else:
+                        nmax_err = None
+                except Exception:
+                    nmax_err = None
+            else:
+                nmax_err = None
+            out.append({"nu_max": _f(nmax), "nu_max_err": _f(nmax_err)})
+        except Exception:
+            out.append({"nu_max": None, "nu_max_err": None})
+    return out
+
+
+def _make_band_block(fitres, *, peak_hz: Optional[float] = None) -> Dict[str, Any]:
+    """
+    Serialize one FitResult into the band sub-dict.
+
+    Changes from v1.0
+    -----------------
+    - par_errors: [[nu0_err, fwhm_err, amp_err], ...] parallel to pars.
+      Extracted from fitres.p_err (the linear-space parameter covariance
+      matrix in Stingray order [amp_0, nu0_0, fwhm_0, ..., const]).
+      Null entries are stored as null in JSON for components where the
+      Hessian was singular (active bounds, degenerate fit).
+    - const_err: standard deviation of the white-noise constant.
+    """
     if fitres is None or not getattr(fitres, "ok", False):
         return {"ok": False}
 
-    pars = getattr(fitres, "pars", None)
+    pars  = getattr(fitres, "pars", None)
+    nlor  = int(getattr(fitres, "nlor", 0))
+    p_cov = getattr(fitres, "p_err", None)  # (npar, npar) in Stingray order
+
+    # Extract per-component errors from the covariance diagonal.
+    # Stingray order: [amp_0, nu0_0, fwhm_0,  amp_1, nu0_1, fwhm_1, ..., const]
+    # FitResult.pars row order: (nu0, fwhm, amp)
+    par_errors: List[Optional[List]] = []
+    const_err: Optional[float] = None
+
+    if p_cov is not None and isinstance(p_cov, np.ndarray) and p_cov.ndim == 2:
+        diag = np.diag(p_cov)
+        for k in range(nlor):
+            base = 3 * k
+            try:
+                amp_var  = float(diag[base])
+                nu0_var  = float(diag[base + 1])
+                fwhm_var = float(diag[base + 2])
+                # Only store if all variances are non-negative and finite
+                if (np.isfinite(amp_var)  and amp_var  >= 0 and
+                    np.isfinite(nu0_var)  and nu0_var  >= 0 and
+                    np.isfinite(fwhm_var) and fwhm_var >= 0):
+                    par_errors.append([
+                        float(np.sqrt(nu0_var)),   # matches pars col 0
+                        float(np.sqrt(fwhm_var)),  # matches pars col 1
+                        float(np.sqrt(amp_var)),   # matches pars col 2
+                    ])
+                else:
+                    par_errors.append(None)
+            except (IndexError, ValueError):
+                par_errors.append(None)
+        # const error: index 3*nlor in Stingray p_opt
+        try:
+            cv = float(diag[3 * nlor])
+            const_err = float(np.sqrt(cv)) if (np.isfinite(cv) and cv >= 0) else None
+        except (IndexError, ValueError):
+            const_err = None
+    else:
+        par_errors = [None] * nlor
+
     return {
         "ok":           True,
         "message":      str(getattr(fitres, "message",     "")),
-        "nlor":         int(getattr(fitres, "nlor",        0)),
+        "nlor":         nlor,
         "rchi2":        _f(getattr(fitres, "rchi2",        np.nan)),
         "aic":          _f(getattr(fitres, "aic",          np.nan)),
         "bic":          _f(getattr(fitres, "bic",          np.nan)),
         "deviance":     _f(getattr(fitres, "deviance",     np.nan)),
         "red_deviance": _f(getattr(fitres, "red_deviance", np.nan)),
         "const":        _f(getattr(fitres, "const",        0.0)),
+        "const_err":    const_err,
+        "peak_hz":      _f(peak_hz),
         "comp_types":   list(getattr(fitres, "comp_types", [])),
         "pars": (
             pars.tolist()
             if (pars is not None and hasattr(pars, "tolist"))
             else []
+        ),
+        "par_errors": par_errors,
+        # Characteristic frequencies: nu_max_k = sqrt(nu0_k² + (fwhm_k/2)²)
+        # Stored alongside pars so downstream tools don't need to recompute.
+        "nu_max": _nu_max_list(
+            pars.tolist() if (pars is not None and hasattr(pars, "tolist")) else [],
+            par_errors,
         ),
     }
 

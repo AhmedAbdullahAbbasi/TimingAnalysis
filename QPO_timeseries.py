@@ -35,7 +35,7 @@ Design notes
 - Consecutive epochs are joined by a thin line to reveal temporal evolution.
 - Band labels are derived from QPO_Parameter at runtime so they stay
   consistent with the energy ranges actually used in the analysis.
-- The script  skips any plot whose required columns are absent,
+- The script gracefully skips any plot whose required columns are absent,
   printing a [WARN] line rather than crashing.
 """
 
@@ -421,8 +421,8 @@ def _plot_summary(d: pd.DataFrame, *, outpath: str) -> None:
     panel_cfg = [
         # (title,         ylabel,                 ycol,                       yerrcol,                         fit_ok_gate, y_floor)
         ("Count rate",    "Rate (ct s⁻¹)",        "mean_rate_cps",            None,                            False,       True),
-        ("QPO ν₀ (full)", "ν₀ (Hz)",              "full_fit_qpo_nu0_hz",      None,                            True,        True),
-        ("QPO Q (full)",  "Q = ν₀/FWHM",          "full_fit_qpo_Q",           None,                            True,        True),
+        ("QPO ν_max (full)", "ν_max (Hz)",          "full_fit_qpo_nu_max_hz",   "full_fit_qpo_nu_max_err",       True,        True),
+        ("QPO Q (full)",  "Q = ν₀/FWHM",          "full_fit_qpo_Q",           "full_fit_qpo_Q_err",            True,        True),
         ("Broad RMS (full)", "Fractional RMS",    "broad_rms_0p1_30_full",    "broad_rms_err_full",            False,       True),
     ]
 
@@ -502,35 +502,62 @@ def make_timeseries_plots(df: pd.DataFrame, outdir: str) -> None:
     # ------------------------------------------------------------------
     # 1. QPO centroid frequency ν₀
     # ------------------------------------------------------------------
-    nu_cols = {b: f"{b}_fit_qpo_nu0_hz" for b in BANDS}
+    nu_cols     = {b: f"{b}_fit_qpo_nu0_hz"  for b in BANDS}
+    nu_err_cols = {b: f"{b}_fit_qpo_nu0_err" for b in BANDS}
     if _has_any_col(d, list(nu_cols.values())):
+        use_err = _has_any_col(d, list(nu_err_cols.values()))
         _plot_threepanel(
             d,
-            outpath         = path("qpo_nu_vs_time.png"),
-            title           = "QPO centroid frequency ν₀ vs time",
-            ylabel          = "ν₀ (Hz)",
-            ycols_by_band   = nu_cols,
-            require_fit_ok  = True,
+            outpath          = path("qpo_nu_vs_time.png"),
+            title            = "QPO centroid frequency ν₀ vs time",
+            ylabel           = "ν₀ (Hz)",
+            ycols_by_band    = nu_cols,
+            yerrcols_by_band = nu_err_cols if use_err else None,
+            require_fit_ok   = True,
             y_floor_positive = True,
-            connect         = True,
+            connect          = True,
         )
     else:
         print("  [SKIP] qpo_nu_vs_time.png — no QPO ν₀ columns found")
 
     # ------------------------------------------------------------------
-    # 2. QPO FWHM
+    # 1b. QPO characteristic frequency ν_max = sqrt(ν₀² + (FWHM/2)²)
     # ------------------------------------------------------------------
-    fwhm_cols = {b: f"{b}_fit_qpo_fwhm_hz" for b in BANDS}
-    if _has_any_col(d, list(fwhm_cols.values())):
+    nu_max_cols     = {b: f"{b}_fit_qpo_nu_max_hz"  for b in BANDS}
+    nu_max_err_cols = {b: f"{b}_fit_qpo_nu_max_err" for b in BANDS}
+    if _has_any_col(d, list(nu_max_cols.values())):
+        use_err = _has_any_col(d, list(nu_max_err_cols.values()))
         _plot_threepanel(
             d,
-            outpath         = path("qpo_fwhm_vs_time.png"),
-            title           = "QPO FWHM vs time",
-            ylabel          = "FWHM (Hz)",
-            ycols_by_band   = fwhm_cols,
-            require_fit_ok  = True,
+            outpath          = path("qpo_nu_max_vs_time.png"),
+            title            = "QPO characteristic frequency ν_max vs time  [√(ν₀² + (FWHM/2)²)]",
+            ylabel           = "ν_max (Hz)",
+            ycols_by_band    = nu_max_cols,
+            yerrcols_by_band = nu_max_err_cols if use_err else None,
+            require_fit_ok   = True,
             y_floor_positive = True,
-            connect         = True,
+            connect          = True,
+        )
+    else:
+        print("  [SKIP] qpo_nu_max_vs_time.png — no ν_max columns found")
+
+    # ------------------------------------------------------------------
+    # 2. QPO FWHM
+    # ------------------------------------------------------------------
+    fwhm_cols     = {b: f"{b}_fit_qpo_fwhm_hz"  for b in BANDS}
+    fwhm_err_cols = {b: f"{b}_fit_qpo_fwhm_err" for b in BANDS}
+    if _has_any_col(d, list(fwhm_cols.values())):
+        use_err = _has_any_col(d, list(fwhm_err_cols.values()))
+        _plot_threepanel(
+            d,
+            outpath          = path("qpo_fwhm_vs_time.png"),
+            title            = "QPO FWHM vs time",
+            ylabel           = "FWHM (Hz)",
+            ycols_by_band    = fwhm_cols,
+            yerrcols_by_band = fwhm_err_cols if use_err else None,
+            require_fit_ok   = True,
+            y_floor_positive = True,
+            connect          = True,
         )
     else:
         print("  [SKIP] qpo_fwhm_vs_time.png — no QPO FWHM columns found")
@@ -538,19 +565,22 @@ def make_timeseries_plots(df: pd.DataFrame, outdir: str) -> None:
     # ------------------------------------------------------------------
     # 3. QPO quality factor Q
     # ------------------------------------------------------------------
-    q_cols = {b: f"{b}_fit_qpo_Q" for b in BANDS}
+    q_cols     = {b: f"{b}_fit_qpo_Q"     for b in BANDS}
+    q_err_cols = {b: f"{b}_fit_qpo_Q_err" for b in BANDS}
     if _has_any_col(d, list(q_cols.values())):
+        use_err = _has_any_col(d, list(q_err_cols.values()))
         _plot_threepanel(
             d,
-            outpath         = path("qpo_Q_vs_time.png"),
-            title           = "QPO quality factor Q vs time",
-            ylabel          = "Q = ν₀ / FWHM",
-            ycols_by_band   = q_cols,
-            require_fit_ok  = True,
+            outpath          = path("qpo_Q_vs_time.png"),
+            title            = "QPO quality factor Q vs time",
+            ylabel           = "Q = ν₀ / FWHM",
+            ycols_by_band    = q_cols,
+            yerrcols_by_band = q_err_cols if use_err else None,
+            require_fit_ok   = True,
             y_floor_positive = True,
-            connect         = True,
-            hline           = float(getattr(P, "QPO_MIN_Q", 3.0)),
-            hline_label     = f"Q_min = {getattr(P, 'QPO_MIN_Q', 3.0):.0f}",
+            connect          = True,
+            hline            = float(getattr(P, "QPO_MIN_Q", 3.0)),
+            hline_label      = f"Q_min = {getattr(P, 'QPO_MIN_Q', 3.0):.0f}",
         )
     else:
         print("  [SKIP] qpo_Q_vs_time.png — no QPO Q columns found")
@@ -595,17 +625,20 @@ def make_timeseries_plots(df: pd.DataFrame, outdir: str) -> None:
     # ------------------------------------------------------------------
     # 5. QPO integrated power rms²
     # ------------------------------------------------------------------
-    rms2_cols = {b: f"{b}_fit_qpo_rms2" for b in BANDS}
+    rms2_cols     = {b: f"{b}_fit_qpo_rms2"     for b in BANDS}
+    rms2_err_cols = {b: f"{b}_fit_qpo_rms2_err" for b in BANDS}
     if _has_any_col(d, list(rms2_cols.values())):
+        use_err = _has_any_col(d, list(rms2_err_cols.values()))
         _plot_threepanel(
             d,
-            outpath         = path("qpo_rms2_vs_time.png"),
-            title           = "QPO integrated power (rms²) vs time",
-            ylabel          = "QPO rms²  (frac-rms²)",
-            ycols_by_band   = rms2_cols,
-            require_fit_ok  = True,
+            outpath          = path("qpo_rms2_vs_time.png"),
+            title            = "QPO integrated power (rms²) vs time",
+            ylabel           = "QPO rms²  (frac-rms²)",
+            ycols_by_band    = rms2_cols,
+            yerrcols_by_band = rms2_err_cols if use_err else None,
+            require_fit_ok   = True,
             y_floor_positive = True,
-            connect         = True,
+            connect          = True,
         )
     else:
         print("  [SKIP] qpo_rms2_vs_time.png — no QPO rms² columns found")
