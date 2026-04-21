@@ -54,10 +54,6 @@ def lorentz(freq: np.ndarray, nu0: float, fwhm: float, amp: float) -> np.ndarray
     return float(amp) * g * g / ((f - float(nu0)) ** 2 + g * g)
 
 
-def lorentz_integral_exact(amp: float, fwhm: float) -> float:
-    return float(np.pi / 4.0 * float(amp) * float(fwhm))
-
-
 def component_power_integral(
     freq: np.ndarray, comp: np.ndarray, fmin: float, fmax: float
 ) -> float:
@@ -110,12 +106,6 @@ def extract_qpo_params_list(
         out.sort(key=lambda d: (-d["qpo_area"], d["qpo_nu0_hz"]))
     return out
 
-
-def extract_qpo_params(
-    fitres, *, qpo_fmin: float, qpo_fmax: float, qmin: float = 3.0
-) -> Optional[Dict[str, Any]]:
-    lst = extract_qpo_params_list(fitres, qpo_fmin=qpo_fmin, qpo_fmax=qpo_fmax, qmin=qmin)
-    return lst[0] if lst else None
 
 
 # ---------------------------------------------------------------------------

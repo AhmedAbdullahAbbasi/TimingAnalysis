@@ -1053,20 +1053,6 @@ class TerminalFitter:
             rchi2     = _compute_rchi2(self._p, model, self._e,
                                         m_avg=int(self._m_eff), npar=p_opt.size)
 
-            # ---- DEBUG ----
-            print(f"  [DEBUG] best_aic={best_aic:.3f}  rchi2={rchi2:.3f}  "
-                  f"failed_starts={n_failed}"
-                  + (f"/{n_starts}" if fmethod.lower() != "triplea" else " (TripleA)"))
-            print(f"  [DEBUG] p_opt:")
-            for i in range(nlor):
-                a, x, w = float(p_opt[3*i]), float(p_opt[3*i+1]), float(p_opt[3*i+2])
-                print(f"    [{i}] {comp_types[i]:4s}  amp={a:+.4e}  nu0={x:+.4f}  fwhm={w:.4f}")
-            print(f"    const  amp={const_val:+.4e}  (seed was {const_seed:.4e})")
-            mn, mx = float(np.nanmin(model)), float(np.nanmax(model))
-            print(f"  [DEBUG] model min/max = {mn:+.4e} / {mx:+.4e}  "
-                  f"negative_bins={int(np.sum(model < 0))}")
-            # ---- END DEBUG ----
-
             # Update self.const with the fitted value.
             self.const = const_val
 

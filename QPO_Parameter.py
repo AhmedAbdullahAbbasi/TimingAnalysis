@@ -13,7 +13,6 @@ Changes from v1
 - Per-component continuum centroid limits (narrow / wide / free).
 - Multi-scale smoothing for candidate finding.
 - Higher amplitude and constant caps (guardrails catch pathological cases).
-- cont4 fallback stage for complex states.
 - Relaxed overshoot guardrail for log-rebinned data.
 - Cross-band fallback uses diagnostic peaks when all bands are bad.
 
@@ -23,6 +22,15 @@ Changes from v2
   analytical gradient and true L-BFGS-B box constraints.
   See QPO_TripleA.py for full documentation.
 - AAA_* parameter block for TripleA tuning.
+
+Changes from v3
+---------------
+- Removed unused parameters: FIT_RCHI_TARGET, FIT_HARM_FWHM_MIN/MAX,
+  FIT_HARM_AMP_FACTOR, FIT_CONT_RCHI_FORCE_CONT3, FIT_POSTQPO_CONT3_*,
+  FIT_STAGE1_N_SEEDS, FIT_MULTI_QPO_REQUIRE_IMPROVEMENT, FIT_RESEED_*,
+  FIT_MAX_RETRIES, FIT_CONT4_*, FIT_MULTI_START.
+- Added previously hidden parameters: FIT_QPO_RCHI_IMPROVE_MIN,
+  FIT_CONT_X0_MAX_HZ, PLOT_YMIN, REBIN_DF_HZ, CAND_REBIN_DF_HZ.
 """
 
 from __future__ import annotations
@@ -69,12 +77,12 @@ PEAK_SIGMA_MODE       = "cont"  # "cont": sigma ~ cont/sqrt(m);  "p": sigma ~ p/
 PEAK_RANK_BY          = "height"   # "prominence" or "height"
 
 # Candidate separation / limit (shared with fitter candidate finder)
-PEAK_MIN_SEP_HZ     = 0.12
+PEAK_MIN_SEP_HZ     = 0.10
 PEAK_MAX_CANDIDATES = 8
 
 # Candidate finder prominence threshold.
 # Now operates in z-score space (sigma units) instead of ratio space.
-PEAK_PROMINENCE = 0.5
+PEAK_PROMINENCE = 0.4
 
 # ==========================
 # RMS INTEGRATION
@@ -90,7 +98,8 @@ QPO_BW_MAX  = 2.00   # Hz — maximum half-width
 # PLOT SETTINGS
 # ==========================
 PLOT_DPI  = 200
-CLOBBER   = True       # overwrite existing output files
+PLOT_YMIN = 1e-6   # floor for the PDS y-axis lower bound
+CLOBBER   = True   # overwrite existing output files
 
 # ==========================
 # ENERGY BANDS
@@ -138,9 +147,12 @@ QPO_SORT_BY = "area"   # "area", "freq", or "q"
 #
 # "Powell" / "Nelder-Mead": Stingray's gradient-free path (legacy).
 #   Use for comparison or if QPO_TripleA.py is not available.
-FIT_METHOD      = "TripleA"
-FIT_RCHI_MAX    = 1.5     # marks fit_ok=False in CSV if rchi2 > this
-FIT_RCHI_TARGET = 1.3     # retry ladder stops early once rchi2 <= this
+FIT_METHOD   = "TripleA"
+FIT_RCHI_MAX = 1.5     # marks fit_ok=False in CSV if rchi2 > this
+
+# Minimum rchi2 improvement required to accept a QPO when the IC gate fails.
+# Set to 0.0 to rely on the IC gate alone.
+FIT_QPO_RCHI_IMPROVE_MIN = 0.05
 
 # ==========================
 # FITTING: CONSTANT (WHITE-NOISE FLOOR)
@@ -154,14 +166,11 @@ FIT_CONST_CAP_FACTOR = 5.0
 # ==========================
 # FITTING: MULTI-START ROBUSTNESS
 # ==========================
-# Controls the outer _jittered_starts loop in _run_stage.
-# When FIT_METHOD = "TripleA", the total independent starts per stage call
-# is FIT_N_STARTS × AAA_N_STARTS (outer × inner).  The outer loop provides
-# diversity across continuum + QPO joint configurations; the inner loop
-# polishes each configuration with L-BFGS-B.
-# In the interactive fitter the outer loop is bypassed, so only AAA_N_STARTS
-# starts run.
-FIT_MULTI_START = True
+# FIT_N_STARTS and FIT_JITTER_FRAC apply to the Stingray/Powell path only
+# (QPO_interactive.py when fit_method is set to Powell or Nelder-Mead).
+# The TripleA optimiser manages its own restarts via AAA_N_STARTS and
+# AAA_JITTER_STD_LOG / AAA_JITTER_STD_NU0; these two params have no effect
+# on the default TripleA batch pipeline.
 FIT_N_STARTS    = 3
 FIT_JITTER_FRAC = 0.12
 FIT_RANDOM_SEED = 42
@@ -175,7 +184,11 @@ FIT_RANDOM_SEED = 42
 # - "Free":   cont3/cont4 components.  Allowed anywhere in the low-frequency band.
 FIT_CONT_X0_NARROW_HZ = 0.3    # broadest Lorentzian: ±0.3 Hz
 FIT_CONT_X0_WIDE_HZ   = 3.0    # medium Lorentzian:   ±3.0 Hz
-FIT_CONT_X0_FREE_HZ   = 8.0    # cont3/cont4:         ±8.0 Hz
+FIT_CONT_X0_FREE_HZ   = 8.0    # cont3:               ±8.0 Hz
+
+# Single continuum centroid bound used by the interactive fitter (one limit
+# covers all continuum components; conservative default matches NARROW_HZ).
+FIT_CONT_X0_MAX_HZ    = 0.2    # interactive fitter: |ν₀| ≤ this for continuum
 
 FIT_CONT_FWHM_MIN = 0.30
 FIT_CONT_FWHM_MAX = 64.0
@@ -183,21 +196,14 @@ FIT_CONT_FWHM_MAX = 64.0
 FIT_QPO_FWHM_MIN  = 0.08
 FIT_QPO_FWHM_MAX  = 5.0
 
-FIT_HARM_FWHM_MIN = 0.03
-FIT_HARM_FWHM_MAX = 8.0
-
 # Amplitude caps as multiples of the low-frequency power level.
 # Raised from 5/8 to 12/12 — guardrails prevent pathological fits.
 FIT_CONT_AMP_FACTOR = 12.0
 FIT_QPO_AMP_FACTOR  = 12.0
-FIT_HARM_AMP_FACTOR = 5.0
 
 # QPO seed width: initial FWHM = max(FWHM_MIN_ABS, FWHM_FRAC * nu0)
 FIT_QPO_FWHM_FRAC    = 0.03
 FIT_QPO_FWHM_MIN_ABS = 0.08
-
-# Harmonic search (currently not used inside fitter; kept for API compatibility)
-DO_HARMONIC_SEARCH = False
 
 # ==========================
 # FITTING: GUARDRAILS
@@ -209,11 +215,6 @@ FIT_GUARD_OVERSHOOT_KSIGMA       = 4.0
 FIT_GUARD_OVERSHOOT_MAX_RUN_BINS = 6
 FIT_GUARD_OVERSHOOT_MAX_FRAC     = 0.10
 FIT_GUARD_COMP_LOCAL_AMP_FACTOR  = 6.0
-
-# ==========================
-# FITTING: RETRY LADDER
-# ==========================
-FIT_MAX_RETRIES = 3
 
 # ==========================
 # OPTIMIZER: TRIPLEA (AAA)
@@ -262,32 +263,11 @@ AAA_MAXITER        = 1000
 # MODEL ORDER SELECTION (IC)
 # ==========================
 CONT_IC_CRITERION = "aic"
-CONT_IC_DELTA_MIN = 15.0
+CONT_IC_DELTA_MIN = 12.0
 
 QPO_IC_CRITERION = "aic"
 #If Qpos weak (as in the case of GX339-4) keep low (even 0). If qpos strong, can increase. 
 QPO_IC_DELTA_MIN = 0
-
-# ==========================
-# FITTING: FORCED THIRD CONTINUUM
-# ==========================
-FIT_CONT_RCHI_FORCE_CONT3 = 1.5
-
-# Post-QPO cont3 rescue trigger.
-FIT_POSTQPO_CONT3_TRIGGER_RCHI      = 1.5
-FIT_POSTQPO_CONT3_RCHI_IMPROVE_MIN  = 0.05
-FIT_POSTQPO_CONT3_IC_DELTA_MIN      = 0.0
-
-# ==========================
-# FITTING: FOURTH CONTINUUM FALLBACK
-# ==========================
-# When cont3+QPO still yields rchi2 above threshold, try cont4.
-# Gated by BIC to prevent overfitting.  Useful for hard-intermediate states
-# (GX 339-4 Lh + Lb + Lu + QPO decomposition).
-FIT_CONT4_ENABLE          = False
-FIT_CONT4_TRIGGER_RCHI    = 1.5   # only try cont4 if current rchi2 > this
-FIT_CONT4_IC_CRITERION    = "bic"  # strict criterion to prevent overfitting
-FIT_CONT4_IC_DELTA_MIN    = 30.0
 
 # ==========================
 # CROSS-BAND RESEEDING
@@ -306,27 +286,13 @@ CROSS_BAND_USE_DIAG_PEAKS_FALLBACK = True
 CROSS_BAND_QPO_AREA_MIN = 1e-4
 
 # Multi-seed Stage 1
-FIT_STAGE1_N_SEEDS = 6
-
-# Multi-QPO growth
-FIT_MAX_QPOS                    = 3
+FIT_MAX_QPOS               = 3
 # IC delta required to UPGRADE from 1-QPO to 2-QPO.
 # Kept separate from QPO_IC_DELTA_MIN so primary QPO detection stays sensitive
 # (delta=0) while secondary QPO detection is strictly gated.
 # A value of 5 means the 2-QPO AIC must beat the 1-QPO AIC by ≥ 5 — roughly
 # one additional free parameter must be fully justified by the data.
-FIT_MULTI_QPO_IC_DELTA_MIN      = 5
-FIT_MULTI_QPO_REQUIRE_IMPROVEMENT = True
-
-# Conditional reseed
-FIT_RESEED_ENABLE          = True
-FIT_RESEED_RCHI_BAD        = 1.5
-FIT_RESEED_EDGE_FRAC       = 0.08
-FIT_RESEED_AREA_MIN        = 1e-3
-FIT_RESEED_EXCLUDE_HZ_MIN  = 0.5
-FIT_RESEED_EXCLUDE_DF_MULT = 10.0
-FIT_RESEED_PROM_FACTOR     = 1.25
-FIT_RESEED_SIGMA_FACTOR    = 1.10
+FIT_MULTI_QPO_IC_DELTA_MIN = 5
 
 # ==========================
 # REBINNING (frequency domain)
@@ -334,9 +300,9 @@ FIT_RESEED_SIGMA_FACTOR    = 1.10
 DO_REBIN   = True
 REBIN_MODE = "log"
 
-REBIN_LOG_F = 0.01
-
+REBIN_LOG_F  = 0.01
 REBIN_FACTOR = 4.0
+REBIN_DF_HZ  = None   # fixed Hz bin width for linear rebinning; None → use REBIN_FACTOR
 
 # ==========================
 # CANDIDATE REBINNING (lighter, for peak finding / seed grid)
@@ -344,10 +310,10 @@ REBIN_FACTOR = 4.0
 DO_CANDIDATE_LIGHT_REBIN   = True
 DO_REBIN_CAND_WHEN_FIT_OFF = True
 
-CAND_REBIN_MODE  = "log"
-CAND_REBIN_LOG_F = 0.008
-
+CAND_REBIN_MODE   = "log"
+CAND_REBIN_LOG_F  = 0.008
 CAND_REBIN_FACTOR = 2.0
+CAND_REBIN_DF_HZ  = None   # fixed Hz bin width for linear candidate rebinning; None → use CAND_REBIN_FACTOR
 
 # ==========================
 # PARALLEL EXECUTION
@@ -428,13 +394,6 @@ def _validate_config() -> None:
 
     # Fit params
     _chk_pos("FIT_RCHI_MAX",    FIT_RCHI_MAX)
-    _chk_pos("FIT_RCHI_TARGET", FIT_RCHI_TARGET)
-    if FIT_RCHI_TARGET > FIT_RCHI_MAX:
-        warnings.warn(
-            f"FIT_RCHI_TARGET ({FIT_RCHI_TARGET}) > FIT_RCHI_MAX ({FIT_RCHI_MAX}): "
-            "the early-stop target is looser than the acceptance threshold.",
-            UserWarning, stacklevel=2,
-        )
     _chk_pos("FIT_N_STARTS",    FIT_N_STARTS)
     _chk_range("FIT_JITTER_FRAC", FIT_JITTER_FRAC, 0.0, 1.0)
     _chk_pos("FIT_CONST_SEED_FMIN", FIT_CONST_SEED_FMIN)
@@ -446,6 +405,8 @@ def _validate_config() -> None:
     _chk_pos("FIT_CONT_FWHM_MAX",   FIT_CONT_FWHM_MAX)
     _chk_pos("FIT_QPO_FWHM_MIN",    FIT_QPO_FWHM_MIN)
     _chk_pos("FIT_QPO_FWHM_MAX",    FIT_QPO_FWHM_MAX)
+    _chk_pos("FIT_QPO_RCHI_IMPROVE_MIN", FIT_QPO_RCHI_IMPROVE_MIN, allow_zero=True)
+    _chk_pos("FIT_CONT_X0_MAX_HZ",       FIT_CONT_X0_MAX_HZ)
     if FIT_CONT_FWHM_MIN >= FIT_CONT_FWHM_MAX:
         errors.append("FIT_CONT_FWHM_MIN must be < FIT_CONT_FWHM_MAX")
     if FIT_QPO_FWHM_MIN >= FIT_QPO_FWHM_MAX:
@@ -474,6 +435,15 @@ def _validate_config() -> None:
     _chk_band("SOFT_BAND_KEV",  SOFT_BAND_KEV)
     _chk_band("HARD_BAND_KEV",  HARD_BAND_KEV)
     _chk_band("BROAD_RMS_BAND", BROAD_RMS_BAND)
+
+    # Plot
+    _chk_pos("PLOT_YMIN", PLOT_YMIN)
+
+    # Optional rebin df values (None is valid; if set, must be positive)
+    if REBIN_DF_HZ is not None:
+        _chk_pos("REBIN_DF_HZ", REBIN_DF_HZ)
+    if CAND_REBIN_DF_HZ is not None:
+        _chk_pos("CAND_REBIN_DF_HZ", CAND_REBIN_DF_HZ)
 
     # Workers
     if int(N_WORKERS) < 1:

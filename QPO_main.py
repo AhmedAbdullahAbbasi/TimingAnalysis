@@ -57,7 +57,6 @@ from QPO_fit import (
     _q_err_from_cov,
     _rms2_err_from_cov,
     component_power_integral,
-    extract_qpo_params,
     extract_qpo_params_list,
     fit_lorentzian_family,
     lorentz,
@@ -551,19 +550,14 @@ def _fit_one_band(
         # QPO seeds  (these are the primary signal to the fitter)
         forced_qpo_seeds = list(forced_qpo_seeds) if forced_qpo_seeds else None,
 
-        # Powell-only params (ignored by TripleA, harmless to pass)
-        n_starts     = getattr(P, "FIT_N_STARTS",    3) if getattr(P, "FIT_MULTI_START", True) else 1,
+        # Powell-only params (ignored by TripleA, passed for Stingray/Powell fallback)
+        n_starts     = getattr(P, "FIT_N_STARTS",    3),
         jitter_frac  = getattr(P, "FIT_JITTER_FRAC", 0.12),
-        max_retries  = getattr(P, "FIT_MAX_RETRIES",  3),
         guard_enable                  = getattr(P, "FIT_GUARD_ENABLE",                 True),
         guard_overshoot_ksigma        = getattr(P, "FIT_GUARD_OVERSHOOT_KSIGMA",        4.0),
         guard_overshoot_max_run_bins  = getattr(P, "FIT_GUARD_OVERSHOOT_MAX_RUN_BINS",    6),
         guard_overshoot_max_frac      = getattr(P, "FIT_GUARD_OVERSHOOT_MAX_FRAC",      0.10),
         guard_comp_local_amp_factor   = getattr(P, "FIT_GUARD_COMP_LOCAL_AMP_FACTOR",    6.0),
-        cont4_enable       = getattr(P, "FIT_CONT4_ENABLE",       False),
-        cont4_trigger_rchi = getattr(P, "FIT_CONT4_TRIGGER_RCHI",  1.5),
-        cont4_ic_criterion = getattr(P, "FIT_CONT4_IC_CRITERION", "bic"),
-        cont4_ic_delta_min = getattr(P, "FIT_CONT4_IC_DELTA_MIN", 30.0),
     )
 
     # seed_peak_hz is optional — only pass it if valid
@@ -1029,6 +1023,7 @@ def main():
 
     if parallel and n_workers > 1 and len(obsids) > 1:
         from concurrent.futures import ProcessPoolExecutor, as_completed
+        from QPO_utils import build_evt_path
         import multiprocessing as mp
 
         ctx = mp.get_context(start_meth)
